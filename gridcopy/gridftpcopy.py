@@ -16,7 +16,7 @@ from math import fsum
 from ConfigParser import ConfigParser
 
 
-def configure(configfile="/afs/ifh.de/user/s/stoessl/scratch/ic86_transfer/maddt/gridcopy/config.cfg"):
+def configure(configfile="gridcopy/config.cfg"):
     """
     Read the configfile
     """
@@ -89,12 +89,24 @@ def create_directories(files):
 
     dirs_to_create = set([pth for pth in map(get_local_path,files) if not os.path.exists(pth)])
     #dirs_to_create = set([get_local_path(f) for f in files if not os.path.exists(get_local_path(f))])
-    
-    map(os.makedirs,dirs_to_create)
-    map(write_access,dirs_to_create)
+    dirs_to_create_gsiftp = []
+    for onedir in dirs_to_create:
+        dirs_to_create_gsiftp.append(cfg.get('zeuthen_gsiftp','local_gsiftp_host') +onedir)
+    map(makedir_gridway, dirs_to_create_gsiftp)
+    #map(os.makedirs,dirs_to_create)
+    #map(write_access,dirs_to_create)
     if dirs_to_create:
         logging.info("Created directories %s" %(dirs_to_create.__repr__()))    
 
+def makedir_gridway(path):
+    """
+    Creates and changes read-write access to folder using uberftp
+    """
+    print "Creating folder ", path
+    uberftp_mkdir_command = ["uberftp", "-mkdir", path]
+    subprocess.call(uberftp_mkdir_command)
+    uberftp_chmod_command = ["uberftp", "-chmod", "-r", "775", path]
+    subprocess.call(uberftp_mkdir_command)
 
 def compare_checksums(localcsum,remotecsum):
     """
@@ -136,7 +148,7 @@ def get_files(cfg):
         
         def SortnGroup(list_):
             #list_.sort(key=lambda x: x[3])
-           
+
             #get unique entries using dict
             dList = {}
             for l in list_: dList[l[0]] = l[1:]
@@ -146,37 +158,67 @@ def get_files(cfg):
             sList = sorted(sList,key=lambda i: i[1][1])
             # then sort by run_id (may not be needed)
             sList = sorted(sList,key=lambda i: i[1][3])
-            
+
             return sList
-        
-        cursor = connections["default"].cursor()    
-        
-        #sql = """select u.name, u.path, u.queue_id,u.urlpath_id, r.run_id,u.md5sum from i3filter.urlpath u
-        #                           join i3filter.run r on r.queue_id=u.queue_id
-        #                           where r.dataset_id=1861 and u.dataset_id=1861
-        #                           and u.transferstate="WAITING" """
-        #                           #order by r.run_id""")
 
-        # new query, phone call on 13.6.14 with Dipo, checking for validated runs due to a change
-        # with the .gaps.txt files, which are now tared.
-        #SELECT u.name,u.queue_id,u.urlpath_id,u.transfertime,u.md5sum  FROM i3filter.urlpath u join i3filter.run r on r.queue_id=u.queue_id join i3filter.grl_snapshot_info g on r.run_id=g.run_id where u.dataset_id=1874 and r.dataset_id=1874 and u.transferstate="WAITING" and g.validated limit 1000
-        sql = """SELECT u.name,u.path,u.queue_id,u.urlpath_id,u.transfertime,u.md5sum  FROM i3filter.urlpath u join i3filter.run r on r.queue_id=u.queue_id join i3filter.grl_snapshot_info g on r.run_id=g.run_id where u.dataset_id=%s and r.dataset_id=%s and u.transferstate="WAITING" and g.validated limit %s""" %(cfg.get("database_query","dataset_id"),cfg.get("database_query","dataset_id"),cfg.get("database_query","limit"))
+        cursor = connections["default"].cursor()
+        filter_cursor = connections["filter-db"].cursor()
 
-        #sql = """select u.name, u.path, u.queue_id,u.urlpath_id, u.transfertime,u.md5sum from i3filter.urlpath u
-        #                           where u.dataset_id=%s
-        #                           and u.transferstate="WAITING" limit %s""" %(cfg.get("database_query","dataset_id"),cfg.get("database_query","limit"))
-        #                           #order by r.run_id""")
-        
+        # Query information about validated runs
+        dataset_id = cfg.get("database_query","dataset_id")
 
-        # 1870 for urlpath table  1861 for urlpath_test
+        # In order to be backwards compatible to older datasets, we need to do check the dataset_id
+        # The new DB was introduced with dataset_id 1915 and previous validation flags have been
+        # copied to the new DB as dataset_id = 0 (it is not easily reproduceable to which dataset
+        # the flag corresponded since there was just a flag for L2 data).
+        if int(dataset_id) < 1915:
+            dataset_id = 0
+
+        validation_sql = """
+            SELECT 
+                run_id
+            FROM
+                i3filter.post_processing
+            WHERE
+                dataset_id = %s AND validated
+        """ % dataset_id
+
+        filter_cursor.execute(validation_sql)
+        validated_runs = filter_cursor.fetchall()
+        validated_runs = [str(r[0]) for r in validated_runs]
+
+        # Getting all files that are ready
+        sql = """
+            SELECT
+                u.name, u.path, u.queue_id, u.urlpath_id, u.transfertime, u.md5sum, r.run_id
+            FROM
+                i3filter.urlpath u
+            JOIN
+                i3filter.run r
+                    ON r.queue_id = u.queue_id
+            WHERE
+                u.dataset_id=%s
+                    AND r.dataset_id = %s
+                    AND u.transferstate = "WAITING"
+                    AND r.run_id IN (%s)
+            LIMIT %s
+        """ % (cfg.get("database_query", "dataset_id"),
+               cfg.get("database_query", "dataset_id"),
+               ','.join(validated_runs),
+               cfg.get("database_query","limit")) ### XXX: original query
+
+        print sql
+
         cursor.execute(sql)        
         dbInfo = cursor.fetchall()
-        burnSampleL2 = [b for b in dbInfo if not b[4]%10 and b[0].find("PFFilt")<0]
-        burnSamplePFFilt = [b for b in dbInfo if not b[4]%10 and b[0].find("PFFilt")>=0]
-        OtherL2 = [b for b in dbInfo if b[4]%10 and b[0].find("PFFilt")<0 and b[0].find("GCD")<0]
-        OtherPFFilt = [b for b in dbInfo if b[4]%10 and b[0].find("PFFilt")>=0]
+
+        burnSampleL2 = [b for b in dbInfo if not b[6]%10 and b[0].find("PFFilt")<0]
+        burnSamplePFFilt = [b for b in dbInfo if not b[6]%10 and b[0].find("PFFilt")>=0]
+        OtherL2 = [b for b in dbInfo if b[6]%10 and b[0].find("PFFilt")<0 and b[0].find("GCD")<0]
+        OtherPFFilt = [b for b in dbInfo if b[6]%10 and b[0].find("PFFilt")>=0]
         
-        #print len(dbInfo)
+        print len(dbInfo)
+        #print dbInfo
         #print len(burnSamplePFFilt)
         #print len(burnSampleL2)
         #print len(OtherPFFilt)
@@ -188,7 +230,6 @@ def get_files(cfg):
         if len(OtherL2): Files2Copy.extend(SortnGroup(OtherL2))
         if len(burnSamplePFFilt): Files2Copy.extend(SortnGroup(burnSamplePFFilt))
         if len(OtherPFFilt): Files2Copy.extend(SortnGroup(OtherPFFilt))
-        
         logging.info("Retrieved %i files to copy from database" %len(Files2Copy))
         #for f in Files2Copy: print f
         return Files2Copy
@@ -292,7 +333,8 @@ def sanitize_local_files(files):
     """
     check if files exists and have a size larger than 0
     """
-    
+    #for onef in files:
+    #    print "sanitize_local_files", get_local_filename(onef)
     def alive(f):
         name = get_local_filename(f)
         if os.path.exists(name):
@@ -313,16 +355,33 @@ def remove(files):
 
     filenames = map(get_local_filename,files)
     filenames = filter(os.path.exists,filenames)
+    print "Removing: ", filenames
     removed = []
     logging.debug("Will remove %i files" %len(filenames))
     if not filenames:
         return removed
     try:
-        removed   = map(os.remove,filenames)
+        for onefile in filenames:
+            rm_flag = remove_gridway(cfg.get('zeuthen_gsiftp','local_gsiftp_host') +onefile)
+            if rm_flag != 0: 
+                raise OSError
+            else: 
+                removed.append(rm_flag)
+        print removed
+        #removed   = map(os.remove,filenames)
     except OSError:
         logging.warning("Can not remove files %s !" %(filenames.__repr__()))
     logging.info("Removed %i files" %len(removed))
     return removed
+
+def remove_gridway(path):
+    """
+    Deletes the file via ftp
+    """
+    uberftp_rm_command = ["uberftp", "-rm", path]
+    print uberftp_rm_command
+    return subprocess.call(uberftp_rm_command)
+     
 
 #@transaction.commit_manually
 def local_csum_check(files,cfg,set_ignored=False):
